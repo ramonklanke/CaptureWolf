@@ -1,0 +1,238 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  VERSION: 1.0.18
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+  
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Restore dependencies
+      run: dotnet restore ./Windows/CaptureWolf.sln
+
+    - name: Setup VS Dev Environment
+      uses: seanmiddleditch/gha-setup-vsdevenv@v4
+
+    - name: Update assembly version in .csproj files
+      run: |
+        $projects = Get-ChildItem -Path ./Windows -Filter *.csproj -Recurse
+        foreach ($project in $projects) {
+          $content = Get-Content -Path $project.FullName -Raw
+          $content = $content -replace '(?<=<Version>)\d+\.\d+\.\d+', '${{ env.VERSION }}'
+          Set-Content -Path $project.FullName -Value $content
+          Write-Host "Updated AssemblyVersion in $($project.Name) to ${{ env.VERSION }}"
+        }
+      shell: pwsh
+
+    - name: Update version and product code in .vdproj file
+      run: |
+        $content = Get-Content -Path ./Windows/CaptureWolf.Installer/CaptureWolf.Installer.vdproj -Raw
+        $content = $content -replace '(?<=ProductVersion" = "8:)\d+\.\d+\.\d+', '${{ env.VERSION }}'
+        $newGuid = "{0}" -f ([guid]::NewGuid().ToString().ToUpper())
+        $content = $content -replace '(?<=ProductCode" = "8:{).+?(?=}")', $newGuid
+        Set-Content -Path ./Windows/CaptureWolf.Installer/CaptureWolf.Installer.vdproj -Value $content
+        Write-Host "Updated ProductVersion to ${{ env.VERSION }}"
+        Write-Host "Updated ProductCode to $newGuid"
+      shell: pwsh
+
+    - name: Build
+      run: dotnet build --configuration Release --no-restore ./Windows/CaptureWolf.Form/CaptureWolf.UI.csproj
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-standalone
+        path: ./Windows/CaptureWolf.Form/bin/Release/
+
+    - name: Build Installer
+      run: devenv.com ./Windows/CaptureWolf.Installer/CaptureWolf.Installer.vdproj /build "Release|Any CPU"
+
+    - name: Upload Installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-installer
+        path: ./Windows/CaptureWolf.Installer/Release/
+
+  build-osx:
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/OSX
+
+    steps:
+      - name: Checkout files
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 21
+      
+      - name: Select XCode version
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '15.2.0'
+      
+      - name: Create Cert folder
+        run: mkdir -p cert
+        
+      - name: Decode signing certificate into a file
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.SIGNING_CERT }}
+        run: echo $CERTIFICATE_BASE64 | base64 --decode > ./cert/signing-cert.cer
+      
+      - name: Decode signing key into a file
+        env:
+          KEY_BASE64: ${{ secrets.SIGNING_KEY }}
+        run: echo $KEY_BASE64 | base64 --decode > ./cert/signing-key.p12
+
+      - name: Install dependencies
+        run: bundle install
+
+      - name: Update Info.plist and project.pbxproj files
+        run: |
+          VERSION=${{ env.VERSION }}
+          VERSION_NO_DOTS=$(echo $VERSION | tr -d '.')
+          echo "Version without dots: $VERSION_NO_DOTS"
+          echo "Version with dots: $VERSION"
+          find . -name 'Info.plist' | while read file; do
+            echo "Processing file: $file"
+            sed -i '' -e "s/<key>CFBundleVersion<\/key>[[:space:]]*<string>[[:digit:]]*<\/string>/<key>CFBundleVersion<\/key>\
+            <string>$VERSION_NO_DOTS<\/string>/g" "$file"
+            sed -i '' -e "s/<key>CFBundleShortVersionString<\/key>[[:space:]]*<string>[[:digit:]]*\.[[:digit:]]*\.[[:digit:]]*<\/string>/<key>CFBundleShortVersionString<\/key>\
+            <string>$VERSION<\/string>/g" "$file"
+          done
+          
+          echo "Updating project.pbxproj"
+          sed -i '' -e "s/CURRENT_PROJECT_VERSION = [[:digit:]]*/CURRENT_PROJECT_VERSION = $VERSION_NO_DOTS/g" ./CaptureWolf.xcodeproj/project.pbxproj
+          sed -i '' -e "s/MARKETING_VERSION = .*;/MARKETING_VERSION = $VERSION;/g" ./CaptureWolf.xcodeproj/project.pbxproj
+        shell: bash
+
+      - name: Deploy app
+        run: bundle exec fastlane mac release --verbose
+        env:
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          SIGNING_CERT_FILE_PATH: ./cert/signing-cert.cer
+          SIGNING_KEY_FILE_PATH: ./cert/signing-key.p12
+          KEY_CHAIN_NAME: signing
+ 
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: osx-installer
+          path: ./OSX/release/
+
+  create-release:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-windows, build-osx]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all workflow run artifacts
+      uses: actions/download-artifact@v4
+
+    - name: List directory contents
+      run: |
+        echo "Listing contents of /home/runner/work/CaptureWolf/CaptureWolf/windows-standalone:"
+        ls -al /home/runner/work/CaptureWolf/CaptureWolf/windows-standalone
+        echo "Listing contents of /home/runner/work/CaptureWolf/CaptureWolf/windows-installer:"
+        ls -al /home/runner/work/CaptureWolf/CaptureWolf/windows-installer
+        echo "Listing contents of /home/runner/work/CaptureWolf/CaptureWolf/osx-installer:"
+        ls -al /home/runner/work/CaptureWolf/CaptureWolf/osx-installer
+    
+    - name: Calculate previous version
+      id: prev_version
+      run: |
+        VERSION=${{ env.VERSION }}
+        MAJOR=$(echo $VERSION | cut -d. -f1)
+        MINOR=$(echo $VERSION | cut -d. -f2)
+        PATCH=$(echo $VERSION | cut -d. -f3)
+        PREV_VERSION="$MAJOR.$MINOR.$((PATCH - 1))"
+        echo "PREV_VERSION=$PREV_VERSION" >> $GITHUB_ENV
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.VERSION }}
+        release_name: Release ${{ env.VERSION }}
+        draft: false
+        body: |
+          **Full Changelog**: https://github.com/galadril/CaptureWolf/compare/${{ env.PREV_VERSION }}...${{ env.VERSION }}
+
+          ### ⬇️ Downloads:
+          **Windows**
+          * [🖥️ Standalone](https://github.com/galadril/CaptureWolf/releases/download/${{ env.VERSION }}/windows-standalone.zip)
+          * [💾 Installer](https://github.com/galadril/CaptureWolf/releases/download/${{ env.VERSION }}/windows-installer.zip)
+  
+          **macOS**
+          * [🍎 Installer](https://github.com/galadril/CaptureWolf/releases/download/${{ env.VERSION }}/osx-installer.zip)
+
+    - name: Zip Windows Standalone
+      run: |
+        cd windows-standalone
+        zip -r ../windows-standalone.zip .
+
+    - name: Upload Release Asset (Windows Standalone)
+      id: upload-release-asset-windows-standalone
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} 
+        asset_path: ./windows-standalone.zip
+        asset_name: windows-standalone.zip
+        asset_content_type: application/zip
+
+    - name: Zip Windows Installer
+      run: |
+        cd windows-installer
+        zip -r ../windows-installer.zip .
+
+    - name: Upload Release Asset (Windows Installer)
+      id: upload-release-asset-windows-installer
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} 
+        asset_path: ./windows-installer.zip
+        asset_name: windows-installer.zip
+        asset_content_type: application/zip
+
+    - name: Zip OSX Installer
+      run: |
+        cd osx-installer
+        zip -r ../osx-installer.zip .
+
+    - name: Upload Release Asset (OSX Installer)
+      id: upload-release-asset-osx
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} 
+        asset_path: ./osx-installer.zip
+        asset_name: osx-installer.zip
+        asset_content_type: application/zip
